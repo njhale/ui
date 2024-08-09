@@ -6,6 +6,7 @@ import {GPTScript, RunEventType} from "@gptscript-ai/gptscript";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
+import os from "os";
 
 dotenv.config({path: ['../.env', '../.env.local']});
 
@@ -14,13 +15,15 @@ const USER = 2;
 const STATE_FILE = "state.json";
 let runningScript = null;
 let serverRunning = false;
+let gptscriptInitialized = false;
+let gptscriptInitPromise = null;
 
 export const startAppServer = ({dev, hostname, port, dir}) => {
-    const address = `http://${hostname}:${port ?? 3000}`
+    const address = `http://${hostname}:${port ?? 3000}`;
 
     return new Promise((resolve, reject) => {
         if (serverRunning) {
-            console.log(`server already running at ${address}`)
+            console.log(`server already running at ${address}`);
             return resolve(address);
         }
 
@@ -34,38 +37,54 @@ export const startAppServer = ({dev, hostname, port, dir}) => {
         });
         const handler = app.getRequestHandler();
 
-        app.prepare().then(() => {
-            const httpServer = createServer(handler);
-            const io = new Server(httpServer);
-            const gptscript = new GPTScript({disableCache: process.env.DISABLE_CACHE === "true"});
+        const gptscript = new GPTScript({disableCache: process.env.DISABLE_CACHE === "true"});
 
-            io.on("connection", (socket) => {
-                io.emit("message", "connected");
-                socket.on("run", async (location, tool, args, scriptWorkspace, threadID) => {
-                    if (runningScript) {
-                        await runningScript.close();
-                        runningScript = null;
-                    }
-                    try {
-                        dismount(socket);
-                        await mount(location, tool, args, scriptWorkspace, socket, threadID, gptscript);
-                    } catch (e) {
-                        socket.emit("error", e);
-                    }
+        if (!gptscriptInitialized) {
+            gptscriptInitPromise = initGPTScriptConfig(gptscript)
+                .then(() => {
+                    gptscriptInitialized = true;
+                    console.log('GPTScript config initialized');
+                })
+                .catch((err) => {
+                    console.error('Error initializing GPTScript config:', err);
+                    reject(err);
+                    return;
                 });
-            });
+        }
 
-            httpServer.once("error", (err) => {
+        Promise.resolve(gptscriptInitPromise).then(() => {
+            app.prepare().then(() => {
+                const httpServer = createServer(handler);
+                const io = new Server(httpServer);
+
+                io.on("connection", (socket) => {
+                    io.emit("message", "connected");
+                    socket.on("run", async (location, tool, args, scriptWorkspace, threadID) => {
+                        if (runningScript) {
+                            await runningScript.close();
+                            runningScript = null;
+                        }
+                        try {
+                            dismount(socket);
+                            await mount(location, tool, args, scriptWorkspace, socket, threadID, gptscript);
+                        } catch (e) {
+                            socket.emit("error", e);
+                        }
+                    });
+                });
+
+                httpServer.once("error", (err) => {
+                    reject(err);
+                });
+
+                httpServer.listen(port, () => {
+                    serverRunning = true;
+                    console.log(`> Server is ready at ${address}`);
+                    resolve(address);
+                });
+            }).catch((err) => {
                 reject(err);
             });
-
-            httpServer.listen(port, () => {
-                serverRunning = true;
-                console.log(`> Server is ready at ${address}`);
-                resolve(address);
-            });
-        }).catch((err) => {
-            reject(err);
         });
     });
 };
@@ -324,4 +343,78 @@ const dismount = (socket) => {
     socket.removeAllListeners("confirmResponse");
     socket.removeAllListeners("userMessage");
     socket.removeAllListeners("disconnect");
+}
+
+const initGPTScriptConfig = async (gptscript) => {
+    // Run a non-LLM no-op script to ensure the GPTScript config exists
+    const run = await gptscript.evaluate({
+        instructions: '#!sys.echo noop'
+    })
+    await run.text()
+
+    const configPath = gptscriptConfigPath();
+
+    fs.readFile(configPath, 'utf8', (err, data) => {
+        if (err) {
+            console.error('Error reading config file:', err);
+            return;
+        }
+
+        let config;
+        try {
+            config = JSON.parse(data);
+        } catch (parseErr) {
+            throw new Error(`Error parsing config file: ${parseErr}`);
+        }
+
+        // Default values to add if they don't exist
+        const defaultConfig = {
+            gatewayURL: 'https://gateway-api.gptscript.ai',
+            integrations: {
+                microsoft365: 'microsoft365',
+                slack: 'slack'
+            }
+        };
+
+        // Update the config object with default values if they don't exist
+        config = {
+            ...defaultConfig,
+            ...config,
+            integrations: {
+                ...defaultConfig.integrations,
+                ...config.integrations
+            }
+        };
+
+        // Write the updated config back to the file
+        fs.writeFile(configPath, JSON.stringify(config, null, 2), 'utf8', (writeErr) => {
+            if (writeErr) {
+                console.error('Error writing config file:', writeErr);
+                return;
+            }
+            console.log('Config file updated successfully');
+        });
+    });
+}
+
+function gptscriptConfigPath() {
+    const homeDir = os.homedir();
+    let configPath;
+
+    if (os.platform() === 'darwin') {
+        // macOS
+        configPath = path.join(homeDir, 'Library', 'Application Support', 'gptscript', 'config.json');
+    } else if (os.platform() === 'win32') {
+        // Windows
+        const appDataDir = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
+        configPath = path.join(appDataDir, 'gptscript', 'config.json');
+    } else if (os.platform() === 'linux') {
+        // Linux
+        const configDir = process.env.XDG_CONFIG_HOME || path.join(homeDir, '.config');
+        configPath = path.join(configDir, 'gptscript', 'config.json');
+    } else {
+        throw new Error('Unsupported platform');
+    }
+
+    return configPath;
 }
